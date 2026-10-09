@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "funauth"
-version = "0.2.1"
+version = "0.2.2"
 description = "可复用的登录与注册底座：密码登录、角色、邀请码注册（SQLAlchemy 异步）"
 readme = "README.md"
 requires-python = ">=3.12"
