@@ -1,4 +1,0 @@
-2026-10-09 11:14:03.089 |INFO    | funbuild.core.base : base: 365 | funbuild | - funauth build
-2026-10-09 11:14:03.089 |INFO    | funbuild.core.base : base: 230 | funbuild | - funauth pull
-2026-10-09 11:14:03.554 |INFO    | funbuild.core.uv_build : uv_build: 250 | funbuild | - public server: pypi
-2026-10-09 11:14:06.063 |INFO    | funbuild.core.base : base: 273 | funbuild | - funauth push

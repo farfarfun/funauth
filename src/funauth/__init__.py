@@ -53,6 +53,9 @@ mixin。`User` 表不用动 —— 多种登录方式共用一个账号，靠一
 `(provider, external_id) -> user_id` 的身份表关联，而不是给 `User` 不断加列。
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
+
 from funauth.enums import UserRole, enum_col
 from funauth.errors import (
     AuthError,
@@ -65,7 +68,13 @@ from funauth.models import InviteCodeMixin, TimestampMixin, UserMixin
 from funauth.security import hash_password, verify_password
 from funauth.services import Accounts, describe_invite_status, generate_code
 
-__version__ = "0.1.0"
+try:
+    #: 版本号只有 pyproject.toml 一个来源（funbuild 发版时改那里），这里从已安装的
+    #: 发行元数据读回来。写成字面量的话迟早和 pyproject 对不上，而且对不上了也没人
+    #: 会发现 —— 没有任何东西校验这两处一致。
+    __version__ = _dist_version("funauth")
+except PackageNotFoundError:  # 源码树里直接 import、没装进环境
+    __version__ = "0.0.0.dev0"
 
 __all__ = [
     "Accounts",
