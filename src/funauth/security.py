@@ -22,19 +22,27 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
-def verify_password(password: str, password_hash: str) -> bool:
+def verify_password(password: str, password_hash: str | None) -> bool:
     """校验明文密码是否与已存储的哈希匹配。
 
     Args:
         password: 登录时用户输入的明文密码。
-        password_hash: `hash_password` 生成并落库的哈希值。
+        password_hash: `hash_password` 生成并落库的哈希值。允许是 `None` 或空串
+            —— 外部身份注册出来的账号（微信扫码、邮箱验证码）压根没有密码。
 
     Returns:
-        匹配返回 `True`；不匹配，或 `password_hash` 本身不是合法的 bcrypt
-        哈希格式（例如历史迁移遗留的明文）时返回 `False`。
+        匹配返回 `True`。以下情况一律返回 `False`，**不抛异常**：密码不匹配、
+        `password_hash` 为空（该账号没开密码登录）、`password_hash` 不是合法的
+        bcrypt 格式（例如历史迁移遗留的明文）。
+
+        校验失败只该是一个布尔结果。让它抛出去的话，调用方每多一种脏数据就多
+        一个 500，而这里能给出的正确答案始终是「这个凭据不对」。
     """
+    if not password_hash:
+        return False
     try:
         return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
-    except ValueError:
-        # 哈希格式不对（比如库迁移时手滑存了明文）：当作校验失败而不是 500
+    except (ValueError, TypeError, AttributeError):
+        # 哈希格式不对（库迁移时手滑存了明文）、或者根本不是字符串：当作校验
+        # 失败而不是 500
         return False

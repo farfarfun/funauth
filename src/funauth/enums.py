@@ -22,6 +22,24 @@ def enum_col(py_enum: type[StrEnum], length: int = 32) -> sa.Enum:
     )
 
 
+class AuthProvider(StrEnum):
+    """外部身份的来源，也就是「这个 external_id 是谁发的」。
+
+    这个枚举**会持续扩张**（再接一家就多一个成员），所以必须走 `enum_col` 那条
+    不建 CHECK 约束的路 —— 否则每加一种登录方式都要配一条改约束的迁移。
+
+    `EMAIL` / `PHONE` 和后面几个的性质不一样：前两者是**本系统自己验证**过的
+    标识（发验证码过去，能收到就算证明），后面几个是第三方替你验证的。两类在
+    身份表里是同一个形状，但「谁来证明」不同，合并账号时要当心（见
+    `IdentityMixin.login_with_identity`）。
+    """
+
+    EMAIL = "email"
+    PHONE = "phone"
+    WECHAT = "wechat"
+    QQ = "qq"
+
+
 class UserRole(StrEnum):
     """账号角色，只有两级。
 

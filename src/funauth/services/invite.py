@@ -58,6 +58,7 @@ class InviteMixin(PasswordMixin):
         max_uses: int = 1,
         expires_in_days: int | None = None,
         note: str | None = None,
+        commit: bool = True,
     ) -> Any:
         """签发一张邀请码并落库。
 
@@ -65,6 +66,8 @@ class InviteMixin(PasswordMixin):
             max_uses: 这张码总共能换出几个账号。
             expires_in_days: 多少天后过期；`None` 表示永不过期。
             note: 备注，给签发的人自己记「这张给谁的」。
+            commit: 默认提交。传 `False` 只 flush，把提交留给调用方 —— 要一次
+                签发一批、或者和宿主自己的写入同生共死时用。
 
         Returns:
             已落库的邀请码对象，`code` 字段是生成出来的码值。
@@ -77,8 +80,11 @@ class InviteMixin(PasswordMixin):
             note=note,
         )
         session.add(code)
-        await session.commit()
-        await session.refresh(code)
+        if commit:
+            await session.commit()
+            await session.refresh(code)
+        else:
+            await session.flush()
         return code
 
     async def consume_invite(
@@ -92,9 +98,10 @@ class InviteMixin(PasswordMixin):
         整个塞进 WHERE，由数据库保证只有一个人能把它从 0 改到 1，`rowcount`
         就是裁决结果。
 
-        **不自己提交** —— 调用方（`register_with_invite`）要让「扣名额」和
-        「建账号」同生共死：建号那步因为用户名撞车失败时，名额必须跟着回滚，
-        否则一张码会因为别人手滑输了个重名用户名而白白少一个名额。
+        **不自己提交，也没有 `commit` 参数** —— 调用方（`register_with_invite`）
+        要让「扣名额」和「建账号」同生共死：建号那步因为用户名撞车失败时，名额
+        必须跟着回滚，否则一张码会因为别人手滑输了个重名用户名而白白少一个名额。
+        给它一个 `commit=True` 的选项就是把这个坑重新挖开。
 
         Raises:
             InviteUnusable: 码不存在、已吊销、已过期，或名额已用完。
@@ -109,14 +116,17 @@ class InviteMixin(PasswordMixin):
                 model.used_count < model.max_uses,
                 (model.expires_at.is_(None)) | (model.expires_at > moment),
             )
-            .values(used_count=model.used_count + 1, updated_at=moment)
+            .values(used_count=model.used_count + 1)
             .execution_options(synchronize_session=False)
         )
         if not result.rowcount:
             raise InviteUnusable(UNUSABLE)
 
-    async def revoke_invite(self, session: AsyncSession, code: str) -> bool:
+    async def revoke_invite(self, session: AsyncSession, code: str, *, commit: bool = True) -> bool:
         """吊销一张码。重复吊销是幂等的。
+
+        Args:
+            commit: 默认提交，传 `False` 把提交留给调用方。
 
         Returns:
             码存在返回 `True`，不存在返回 `False`。
@@ -124,10 +134,11 @@ class InviteMixin(PasswordMixin):
         result = await session.execute(
             update(self.invite_model)
             .where(self.invite_model.code == code)
-            .values(is_active=False, updated_at=utcnow())
+            .values(is_active=False)
             .execution_options(synchronize_session=False)
         )
-        await session.commit()
+        if commit:
+            await session.commit()
         return bool(result.rowcount)
 
     async def list_invites(self, session: AsyncSession) -> list[Any]:
@@ -144,7 +155,13 @@ class InviteMixin(PasswordMixin):
         return describe_invite_status(code, now=now)
 
     async def register_with_invite(
-        self, session: AsyncSession, username: str, password: str, invite_code: str
+        self,
+        session: AsyncSession,
+        username: str,
+        password: str,
+        invite_code: str,
+        *,
+        commit: bool = True,
     ) -> Any:
         """凭邀请码自助注册一个账号。
 
@@ -156,12 +173,18 @@ class InviteMixin(PasswordMixin):
         递增的 `used_count` 跟着回滚 —— 不然别人手滑输了个重名用户名，这张码
         就白少一次，而签发的人完全看不出为什么。
 
+        Args:
+            commit: 默认提交。传 `False` 只 flush，提交留给调用方。这两步
+                **始终**在一个事务里，`commit=False` 只是把这个事务的边界再往
+                外推一层，不会把它们拆开。
+
         Raises:
             InviteUnusable: 码不存在 / 已吊销 / 已过期 / 已用完。
             UsernameTaken: 用户名已被占用。
         """
         await self.consume_invite(session, invite_code)
         user = await self._insert(session, username, password, UserRole.GUEST)
-        await session.commit()
-        await session.refresh(user)
+        if commit:
+            await session.commit()
+            await session.refresh(user)
         return user

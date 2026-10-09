@@ -9,6 +9,7 @@
 解析不出来 —— 这和 `contrib/fastapi.py` 自己不写那一行是同一个原因。
 """
 
+import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
@@ -45,10 +46,13 @@ class Harness:
         return AsyncClient(transport=ASGITransport(app=self.app), base_url="http://test")
 
 
-def build_harness(engine, *, with_invite: bool = True) -> Harness:
+def build_harness(engine, *, with_invite: bool = True, store=None, parse_user_id=uuid.UUID):
     """拼出一个最小宿主：会话依赖 + SessionMiddleware + 两道门 + auth 路由。
 
     这同时是宿主侧接法的可执行文档 —— README 里那段示例代码在这里真跑一遍。
+
+    `store` / `parse_user_id` 给下面 `TestSessionStore` 用：两个工厂必须拿到
+    同一套，否则「登录写进去的」和「门禁读出来的」会是两个地方。
     """
     accounts = Accounts(
         user_model=User,
@@ -71,7 +75,9 @@ def build_harness(engine, *, with_invite: bool = True) -> Harness:
     app = FastAPI()
     app.add_middleware(SessionMiddleware, secret_key="test-secret")
 
-    guards = make_user_deps(accounts=accounts, session_dep=session_dep)
+    guards = make_user_deps(
+        accounts=accounts, session_dep=session_dep, store=store, parse_user_id=parse_user_id
+    )
 
     @app.get("/protected")
     async def protected(user: guards.current_user) -> dict[str, Any]:
@@ -84,6 +90,8 @@ def build_harness(engine, *, with_invite: bool = True) -> Harness:
     auth_router = make_auth_router(
         accounts=accounts,
         session_dep=session_dep,
+        store=store,
+        parse_user_id=parse_user_id,
         registration_enabled_dep=enabled_dep,
     )
     app.include_router(auth_router)
@@ -417,6 +425,98 @@ class TestShape:
             "/identity/me",
         }
         assert all(r.tags == ["身份"] for r in router.routes)
+
+
+class _ScriptedStore:
+    """一个能被测试直接摆弄的 `SessionStore`，用来模拟各种脏会话。
+
+    顺带也是「换会话方案不用动任何 handler」那个承诺的证据 —— 这里完全没碰
+    Starlette 的 `request.session`。
+    """
+
+    def __init__(self, user_id=None):
+        self.user_id = user_id
+        self.logout_calls = 0
+
+    def login(self, request, user_id):
+        self.user_id = user_id
+
+    def current(self, request):
+        return self.user_id
+
+    def logout(self, request):
+        self.user_id = None
+        self.logout_calls += 1
+
+
+class TestSessionStore:
+    """自定义 store，以及会话里存了脏东西时的行为。"""
+
+    async def test_custom_store_replaces_cookies_entirely(self, engine, session):
+        store = _ScriptedStore()
+        harness = build_harness(engine, store=store)
+        await harness.accounts.create_user(session, "boss", "pw123456", UserRole.ADMIN)
+
+        async with harness.client() as c:
+            r = await c.post("/auth/login", json={"username": "boss", "password": "pw123456"})
+            assert r.status_code == 200
+            assert store.user_id is not None, "登录没写进自定义 store"
+            # cookie 一个都没发 —— 登录态完全在 store 手里
+            assert "session" not in c.cookies
+            assert (await c.get("/auth/me")).json()["username"] == "boss"
+            assert (await c.get("/ops")).status_code == 200
+
+            assert (await c.post("/auth/logout")).status_code == 204
+            assert store.logout_calls == 1
+            assert (await c.get("/auth/me")).json() is None
+
+    @pytest.mark.parametrize(
+        ("name", "stored"),
+        [
+            ("不是 uuid", "not-a-uuid"),
+            ("空白", "   "),
+            ("整型 id", "42"),
+            ("根本不是字符串", 42),
+        ],
+    )
+    async def test_garbage_user_id_is_not_a_500(self, engine, name, stored):
+        """会话里存了个不是主键形状的东西，得当「登录失效」处理，不能 500。
+
+        现实来路：换过会话方案、换过 secret_key、宿主自己的 store 存了别的结构。
+        让 `uuid.UUID()` 的 ValueError 原样抛出去就是个 500，而这件事的正确
+        答案是「请重新登录」。
+        """
+        store = _ScriptedStore(stored)
+        harness = build_harness(engine, store=store)
+
+        async with harness.client() as c:
+            me = await c.get("/auth/me")
+            assert me.status_code == 200, f"{name}: /me 应该回 null 而不是 {me.status_code}"
+            assert me.json() is None
+
+            gated = await c.get("/protected")
+            assert gated.status_code == 401, f"{name}: 门禁应该回 401 而不是 {gated.status_code}"
+
+        # 脏会话被清掉了，下个请求不用再白走一遍
+        assert store.logout_calls > 0, f"{name}: 脏会话没被清掉"
+
+    async def test_parse_user_id_is_actually_used(self, engine):
+        """`parse_user_id` 是给非 UUID 主键的宿主留的出口，得真的接上。"""
+        seen = []
+        raw_id = str(uuid.uuid4())
+
+        def spy(raw):
+            seen.append(raw)
+            return uuid.UUID(raw)
+
+        harness = build_harness(engine, store=_ScriptedStore(raw_id), parse_user_id=spy)
+
+        async with harness.client() as c:
+            # 格式合法但库里没有这个账号，所以还是 null —— 这里看的是转换有没有
+            # 走我们给的函数
+            assert (await c.get("/auth/me")).json() is None
+
+        assert seen == [raw_id], "parse_user_id 没被调用，或者拿到的不是会话里那个值"
 
 
 @pytest.mark.parametrize(

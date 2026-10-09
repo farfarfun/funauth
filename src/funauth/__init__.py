@@ -2,11 +2,20 @@
 
 ## 现在有什么
 
-- 密码登录 + 两级角色（`UserRole.ADMIN` / `GUEST`）
-- 邀请码注册：限次、限期、可单独吊销，消耗是原子的
-- bcrypt 密码哈希
-- 表结构以 **mixin** 形式提供，具体表由宿主声明在自己的 `Base` 上
-  （理由见 `funauth.models.mixins` 的模块 docstring）
+四条登录路，按需取用（不用的那条不传对应模型即可，没有空表也没有空列）：
+
+- **密码登录** + 两级角色（`UserRole.ADMIN` / `GUEST`），bcrypt 哈希
+- **邀请码注册**：限次、限期、可单独吊销，消耗是原子的
+- **外部身份**（微信 / QQ 扫码）：`(provider, external_id) -> user_id` 一张表，
+  握手由宿主做，本包只管「这个身份是哪个账号」
+- **邮箱 / 短信验证码**：签发、哈希、原子消耗、试错限次、发送限频都在包内，
+  宿主只提供一个「把这段文字发出去」的回调
+
+一个账号可以同时挂多种方式（设了密码、绑了微信、验证过邮箱），`User` 表不会
+因为多接一家而加列。
+
+表结构以 **mixin** 形式提供，具体表由宿主声明在自己的 `Base` 上（理由见
+`funauth.models.mixins` 的模块 docstring）。
 
 ## 不负责什么
 
@@ -45,28 +54,50 @@ except BadCredentials as err:
 
 FastAPI 侧完整的两道门（整站要登录 + 后台要管理员）见 README。
 
-## 往后加登录方式
+## 再接一家第三方
 
-邮箱验证码、短信验证码、QQ / 微信扫码都按同一形状接：各写一个
-`services/*.py` 里的 mixin 挂到 `Accounts` 上，需要存外部身份就再导出一个表
-mixin。`User` 表不用动 —— 多种登录方式共用一个账号，靠一张
-`(provider, external_id) -> user_id` 的身份表关联，而不是给 `User` 不断加列。
+抖音、飞书、GitHub OAuth 这些**不需要**改本包：它们都是「第三方给一个稳定
+id」这个形状，宿主握完手直接调 `Accounts.login_with_identity`，本包这边只是
+`AuthProvider` 多一个成员，没有任何 DDL 变化。
+
+真正需要新 mixin 的是**形状**不同的方式，比如 WebAuthn / passkey（要存公钥、
+要走 challenge-response）。那时候照 `services/identity.py` 的样子再写一个挂到
+`Accounts` 上，`User` 表同样不用动。
 """
 
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
 
-from funauth.enums import UserRole, enum_col
+from funauth.enums import AuthProvider, UserRole, enum_col
 from funauth.errors import (
+    AccountDisabled,
     AuthError,
     BadCredentials,
+    IdentityTaken,
     InviteUnusable,
+    LastLoginMethod,
     PermissionDenied,
+    SignupDisabled,
     UsernameTaken,
+    VerificationFailed,
+    VerificationThrottled,
 )
-from funauth.models import InviteCodeMixin, TimestampMixin, UserMixin
+from funauth.models import (
+    ExternalIdentityMixin,
+    InviteCodeMixin,
+    TimestampMixin,
+    UserMixin,
+    VerificationCodeMixin,
+)
 from funauth.security import hash_password, verify_password
-from funauth.services import Accounts, describe_invite_status, generate_code
+from funauth.services import (
+    Accounts,
+    default_identity_username,
+    describe_invite_status,
+    generate_code,
+    generate_verification_code,
+    normalize_target,
+)
 
 try:
     #: 版本号只有 pyproject.toml 一个来源（funbuild 发版时改那里），这里从已安装的
@@ -77,19 +108,31 @@ except PackageNotFoundError:  # 源码树里直接 import、没装进环境
     __version__ = "0.0.0.dev0"
 
 __all__ = [
+    "AccountDisabled",
     "Accounts",
     "AuthError",
+    "AuthProvider",
     "BadCredentials",
+    "ExternalIdentityMixin",
+    "IdentityTaken",
     "InviteCodeMixin",
     "InviteUnusable",
+    "LastLoginMethod",
     "PermissionDenied",
+    "SignupDisabled",
     "TimestampMixin",
     "UserMixin",
     "UserRole",
     "UsernameTaken",
+    "VerificationCodeMixin",
+    "VerificationFailed",
+    "VerificationThrottled",
+    "default_identity_username",
     "describe_invite_status",
     "enum_col",
     "generate_code",
+    "generate_verification_code",
     "hash_password",
+    "normalize_target",
     "verify_password",
 ]

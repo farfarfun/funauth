@@ -59,18 +59,30 @@ app.include_router(
 """
 
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Annotated, Any, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from funauth.enums import UserRole
-from funauth.errors import BadCredentials, InviteUnusable, PermissionDenied, UsernameTaken
-from funauth.services import Accounts
+from funauth.enums import AuthProvider, UserRole
+from funauth.errors import (
+    AccountDisabled,
+    BadCredentials,
+    InviteUnusable,
+    PermissionDenied,
+    SignupDisabled,
+    UsernameTaken,
+    VerificationFailed,
+    VerificationThrottled,
+)
+from funauth.services import Accounts, normalize_target
 
 __all__ = [
     "AuthConfigOut",
+    "CodeLoginPayload",
+    "CodeRequestPayload",
     "CookieSessionStore",
     "LoginPayload",
     "RegisterPayload",
@@ -78,6 +90,7 @@ __all__ = [
     "UserGuards",
     "UserOut",
     "make_auth_router",
+    "make_code_login_router",
     "make_user_deps",
 ]
 
@@ -144,7 +157,12 @@ class RegisterPayload(BaseModel):
 
 
 class UserOut(BaseModel):
-    """默认出参。宿主要多返回字段就自己继承一个传给 `user_out`。"""
+    """默认出参。宿主要多返回字段就自己继承一个传给 `user_out`。
+
+    `id` 写成 `uuid.UUID` 是跟着 `UserMixin` 的主键类型（`PkType = sa.Uuid`）。
+    宿主换了主键类型（比如整型自增）就得自己传一个 `user_out`，并且把
+    `parse_user_id` 一起换掉 —— 那两处必须对得上。
+    """
 
     id: uuid.UUID
     username: str
@@ -157,6 +175,57 @@ class UserOut(BaseModel):
 
 class AuthConfigOut(BaseModel):
     registration_enabled: bool
+
+
+class CodeRequestPayload(BaseModel):
+    """「给我发个验证码」。"""
+
+    #: 邮箱或手机号。格式校验留给宿主 —— 它知道自己要不要收手机号、收哪个国家的。
+    #: 这里只兜一个长度上限，挡住拿超长字符串灌库的。
+    target: str = Field(min_length=3, max_length=128)
+
+
+class CodeLoginPayload(BaseModel):
+    """「这是我收到的验证码」。"""
+
+    target: str = Field(min_length=3, max_length=128)
+    code: str = Field(min_length=4, max_length=16)
+
+
+# --- 会话 -> 账号 ---------------------------------------------------------------
+
+
+async def _resolve_user(
+    *,
+    accounts: Accounts,
+    session: Any,
+    request: Request,
+    backend: SessionStore,
+    parse_user_id: Callable[[str], Any],
+) -> Any | None:
+    """把会话里的 user_id 换成账号对象；换不出来就清掉会话、返回 `None`。
+
+    调用方自己决定 `None` 对外是 401 还是 `null`，也自己区分「本来就没登录」和
+    「登录过但失效了」—— 前者在调用这里之前一个 `backend.current()` 就能判断。
+    """
+    raw = backend.current(request)
+    if not raw:
+        return None
+    try:
+        user_id = parse_user_id(raw)
+    except (ValueError, TypeError, AttributeError):
+        # 会话里存的东西根本不是主键的形状：上一套会话方案留下的 cookie、换过
+        # 的 secret_key、宿主自己的 SessionStore 存了别的结构。当作「登录失效」
+        # 处理 —— 让 `uuid.UUID()` 的 ValueError 原样抛出去只会变成 500，而这
+        # 件事的正确答案是「请重新登录」。
+        backend.logout(request)
+        return None
+    user = await accounts.get_by_id(session, user_id)
+    if user is None or not user.is_active:
+        # 账号被删或被停用，但 cookie 还在。清掉，否则每个请求都要白查一次库。
+        backend.logout(request)
+        return None
+    return user
 
 
 # --- 两道门 ---------------------------------------------------------------------
@@ -182,6 +251,7 @@ def make_user_deps(
     accounts: Accounts,
     session_dep: Any,
     store: SessionStore | None = None,
+    parse_user_id: Callable[[str], Any] = uuid.UUID,
 ) -> UserGuards:
     """造出整站门禁 + 管理员这两个依赖。
 
@@ -191,6 +261,10 @@ def make_user_deps(
             `Annotated[AsyncSession, Depends(get_session)]`。传注解而不是裸函数，
             宿主在测试里 `dependency_overrides` 才能照常生效。
         store: 登录态存哪儿，默认 Starlette 签名 cookie。
+        parse_user_id: 把会话里的字符串 id 还原成主键值。默认 `uuid.UUID`，对应
+            `UserMixin` 的 `PkType`。宿主换了主键类型（比如整型自增）就传 `int`，
+            并且把 `user_out` 一起换掉。抛 `ValueError` / `TypeError` 会被当成
+            「登录失效」，不会变成 500。
 
     Returns:
         `UserGuards`，两个字段都是能直接当注解用的 `Annotated[...]`。
@@ -201,13 +275,16 @@ def make_user_deps(
     backend = store or CookieSessionStore()
 
     async def get_current_user(request: Request, session: session_dep) -> Any:
-        user_id = backend.current(request)
-        if not user_id:
+        if not backend.current(request):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
-        user = await accounts.get_by_id(session, uuid.UUID(user_id))
-        if user is None or not user.is_active:
-            # 账号被删或被停用，但 cookie 还在。清掉，否则每个请求都要白查一次库。
-            backend.logout(request)
+        user = await _resolve_user(
+            accounts=accounts,
+            session=session,
+            request=request,
+            backend=backend,
+            parse_user_id=parse_user_id,
+        )
+        if user is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已失效，请重新登录"
             )
@@ -242,6 +319,7 @@ def make_auth_router(
     store: SessionStore | None = None,
     registration_enabled_dep: Any = None,
     user_out: type[BaseModel] = UserOut,
+    parse_user_id: Callable[[str], Any] = uuid.UUID,
     prefix: str = "/auth",
     tags: list[str] | None = None,
 ) -> APIRouter:
@@ -263,6 +341,8 @@ def make_auth_router(
             `dependency_overrides` 换掉它。直接捕获一个值或闭包会绕过覆盖，
             于是测试里改不动这个开关。
         user_out: 出参模型，默认 `UserOut`（id / username / role）。
+        parse_user_id: 把会话里的字符串 id 还原成主键值，默认 `uuid.UUID`。
+            和 `make_user_deps` 的同名参数含义一样，两处要传一致的。
         prefix: 路由前缀。宿主再套自己的版本前缀，如
             `include_router(r, prefix="/api/v1")`。
         tags: OpenAPI 标签，默认 `["auth"]`。前端生成 client 时会用到，所以
@@ -321,12 +401,14 @@ def make_auth_router(
         前端启动时无条件打这个接口判断「要不要跳登录页」。回 401 会在控制台里
         刷一片红，而「没登录」是这里完全正常的一种答案，不是错误。
         """
-        user_id = backend.current(request)
-        if not user_id:
-            return None
-        user = await accounts.get_by_id(session, uuid.UUID(user_id))
-        if user is None or not user.is_active:
-            backend.logout(request)
+        user = await _resolve_user(
+            accounts=accounts,
+            session=session,
+            request=request,
+            backend=backend,
+            parse_user_id=parse_user_id,
+        )
+        if user is None:
             return None
         return user_out.model_validate(user)
 
@@ -362,5 +444,146 @@ def make_auth_router(
             except UsernameTaken as err:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(err)) from err
             return _login(request, user)
+
+    return router
+
+
+# --- 验证码登录（邮箱 / 短信）---------------------------------------------------
+
+#: 宿主提供的发送回调：拿到 `(标识, 明文验证码)`，负责把它发出去。
+#:
+#: 发送通道是宿主的（SES / 阿里云 / 腾讯云，各家 SDK 完全不同），凭据逻辑不是。
+#: 这个回调里**不要记日志记明文** —— 那等于把所有人的验证码写进日志系统。
+CodeSender = Callable[[str, str], Awaitable[None]]
+
+
+def make_code_login_router(
+    *,
+    accounts: Accounts,
+    session_dep: Any,
+    sender: CodeSender,
+    provider: AuthProvider = AuthProvider.EMAIL,
+    store: SessionStore | None = None,
+    registration_enabled_dep: Any = None,
+    user_out: type[BaseModel] = UserOut,
+    ttl_seconds: int | None = None,
+    min_interval_seconds: int | None = None,
+    prefix: str | None = None,
+    tags: list[str] | None = None,
+) -> APIRouter:
+    """造出验证码登录的两条路由：`POST /code`（要码）和 `POST /login`（用码登录）。
+
+    同一个工厂同时服务邮箱和短信 —— 两者在本包里是同一条链路，只有 `provider`
+    和发送通道不同。要两种都上就调两次，各挂一个 prefix：
+
+    ```python
+    app.include_router(make_code_login_router(
+        accounts=accounts, session_dep=SessionDep, store=store,
+        provider=AuthProvider.EMAIL, sender=send_email,
+    ))   # -> /auth/email/code, /auth/email/login
+    app.include_router(make_code_login_router(
+        accounts=accounts, session_dep=SessionDep, store=store,
+        provider=AuthProvider.PHONE, sender=send_sms,
+    ))   # -> /auth/phone/code, /auth/phone/login
+    ```
+
+    ## 这里没有用户名枚举面
+
+    `POST /code` 对**任何**标识都照发，不管它注册过没有 —— 因为验证码登录本身
+    就兼注册，「没注册」不是一种失败。所以这个接口不像密码登录那样需要含糊其辞。
+
+    注册开关关着时也照发，只在 `POST /login` 那步回 403。看起来绕，但另一种做法
+    （没注册就不发）等于把「这个邮箱注册过没有」做成了一个公开查询接口。而在
+    `/login` 那步泄漏只泄漏给能收到这封邮件的人 —— 也就是那个邮箱的主人。
+
+    Args:
+        sender: 发送回调，见 `CodeSender`。
+        provider: `AuthProvider.EMAIL` 或 `PHONE`。也决定默认 prefix。
+        ttl_seconds / min_interval_seconds: 透传给 `issue_verification_code`，
+            `None` 用包里的默认值（10 分钟 / 60 秒）。短信比邮件贵，真上短信的
+            时候建议把间隔调大。
+        prefix: 默认 `/auth/{provider}`，例如 `/auth/email`。
+
+    Returns:
+        装好的 `APIRouter`。
+
+    发送失败时会把刚签发的那条记录**删掉**再回 502：不删的话用户既没收到码、
+    又要被限频挡 60 秒，而他什么都没做错。
+    """
+    backend = store or CookieSessionStore()
+    router = APIRouter(prefix=prefix or f"/auth/{provider.value}", tags=tags or ["auth"])
+
+    enabled_dep = (
+        registration_enabled_dep
+        if registration_enabled_dep is not None
+        else Annotated[bool, Depends(lambda: True)]
+    )
+
+    #: 只把调用方显式给了的值透传下去，`None` 的让服务层用自己的默认值 ——
+    #: 在这里把默认值抄一遍迟早和那边对不上。
+    issue_kwargs: dict[str, int] = {}
+    if ttl_seconds is not None:
+        issue_kwargs["ttl_seconds"] = ttl_seconds
+    if min_interval_seconds is not None:
+        issue_kwargs["min_interval_seconds"] = min_interval_seconds
+
+    @router.post("/code", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+    async def request_code(payload: CodeRequestPayload, session: session_dep) -> None:
+        """签发一个验证码并发出去。
+
+        429 带 `Retry-After`，前端可以直接拿它做倒计时，不用自己猜。
+        """
+        try:
+            code, record = await accounts.issue_verification_code(
+                session, provider, payload.target, **issue_kwargs
+            )
+        except VerificationThrottled as err:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=str(err),
+                headers={"Retry-After": str(min_interval_seconds or 60)},
+            ) from err
+
+        try:
+            # 发给规整后的标识，和落库那个保持一致 —— 用户输了 `Me@Example.com`
+            # 而库里存的是小写，发信地址用哪个都能到，但日志里两处对不上很难查。
+            await sender(normalize_target(provider, payload.target), code)
+        except Exception as err:
+            # 码已经提交了。发不出去就把它删掉，否则用户既没收到码、又要被限频
+            # 挡住重发 —— 而这完全是我们这边的故障。
+            await session.delete(record)
+            await session.commit()
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail="验证码发送失败，请稍后重试"
+            ) from err
+
+    @router.post("/login", response_model=user_out)
+    async def login_with_code(
+        payload: CodeLoginPayload,
+        request: Request,
+        session: session_dep,
+        registration_enabled: enabled_dep,
+    ) -> Any:
+        """用验证码登录，没注册过就当场开一个账号（角色恒为 `GUEST`）。
+
+        `VerificationFailed` 的五种成因共用一条消息，不要在这里拆开 —— 拆开就
+        等于告诉爆破方「这个码是对的，只是过期了」。
+        """
+        try:
+            user, _created = await accounts.login_with_code(
+                session,
+                provider,
+                payload.target,
+                payload.code,
+                allow_signup=registration_enabled,
+            )
+        except VerificationFailed as err:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err)) from err
+        except SignupDisabled as err:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(err)) from err
+        except AccountDisabled as err:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(err)) from err
+        backend.login(request, str(user.id))
+        return user_out.model_validate(user)
 
     return router
