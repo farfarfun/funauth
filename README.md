@@ -11,6 +11,8 @@
 - 邀请码注册：限次、限期、可单独吊销，名额消耗是**一条条件 UPDATE**，并发安全
 - 不依赖任何 web 框架，不管 session / cookie / JWT，不管事务边界
 - 列类型可移植：PostgreSQL 与 SQLite 上行为一致（时间列始终 UTC-aware）
+- 可选的 FastAPI 适配（`funauth[fastapi]`）：五个端点 + 整站门禁 / 管理员两道门，
+  宿主一行 `include_router` 接上
 
 ## 不负责什么
 
@@ -21,6 +23,9 @@
 每个方法收一个 `AsyncSession`，什么时候提交由调用方决定 —— 宿主的事务边界各不
 相同（FastAPI 一个请求一个 session、CLI 一条命令一个、后台任务一批一个）。
 
+会话方案和状态码映射在 `funauth.contrib.fastapi` 里有一套现成的（见下文），但那是
+**可选的 extra**，核心这层不认识 HTTP。
+
 ## 环境要求
 
 - Python 3.12 或更高版本
@@ -30,6 +35,9 @@
 
 ```bash
 pip install funauth
+
+# 要用现成的 FastAPI 路由与依赖
+pip install "funauth[fastapi]"
 ```
 
 ## 快速开始
@@ -107,58 +115,88 @@ user = await accounts.register_with_invite(session, "newbie", "pw", code.code)
 那些就是真实存在的账号），注册接口就是个「这个码存不存在」的探测器。真正需要知道
 区别的是运维自己，而运维看得到数据库。
 
-## FastAPI：整站门禁 + 后台管理员，两道门
+## FastAPI
 
-典型需求是「整站要登录才能看，后台还要管理员」。这是两个依赖，不是一个：
-
-```python
-from typing import Annotated
-from fastapi import Depends, HTTPException, Request, status
-from funauth import PermissionDenied, UserRole
-
-
-async def get_current_user(request: Request, session: SessionDep) -> User:
-    """站点门禁：任何已登录且启用的账号都放过。"""
-    user_id = request.session.get("user_id")
-    if user_id is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="未登录")
-    user = await accounts.get_by_id(session, uuid.UUID(user_id))
-    if user is None or not user.is_active:
-        request.session.clear()
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="登录态已失效")
-    return user
-
-
-CurrentUserDep = Annotated[User, Depends(get_current_user)]
-
-
-async def get_admin_user(user: CurrentUserDep) -> User:
-    """后台鉴权：在站点门禁之上再要求 admin。"""
-    try:
-        accounts.require_role(user, UserRole.ADMIN)
-    except PermissionDenied as err:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(err)) from err
-    return user
-
-
-AdminUserDep = Annotated[User, Depends(get_admin_user)]
-```
-
-登录和注册这两个端点本身必须保持公开，否则谁都进不来：
+`pip install "funauth[fastapi]"` 之后，路由和门禁都是现成的：
 
 ```python
-@router.post("/auth/login")
-async def login(payload: LoginPayload, request: Request, session: SessionDep):
-    try:
-        user = await accounts.authenticate(session, payload.username, payload.password)
-    except BadCredentials as err:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=str(err)) from err
-    request.session["user_id"] = str(user.id)
-    return UserOut.model_validate(user)
+from funauth.contrib.fastapi import CookieSessionStore, make_auth_router, make_user_deps
+
+store = CookieSessionStore()
+guard = make_user_deps(accounts=accounts, session_dep=SessionDep, store=store)
+
+app.add_middleware(SessionMiddleware, secret_key=settings.secret_key)
+app.include_router(
+    make_auth_router(
+        accounts=accounts,
+        session_dep=SessionDep,
+        store=store,
+        registration_enabled_dep=RegistrationEnabledDep,
+    ),
+    prefix="/api/v1",
+)
 ```
+
+`make_auth_router` 挂出五个端点，**全部公开** —— 否则没登录的人连登录接口都打不开：
+
+| 端点 | 说明 |
+|---|---|
+| `GET /auth/config` | `{"registration_enabled": bool}`，前端据此决定要不要渲染注册入口 |
+| `POST /auth/login` | 成功写会话并返回用户；失败 401 |
+| `POST /auth/logout` | 204 |
+| `GET /auth/me` | 当前登录者，**没登录返回 `null` 而不是 401** |
+| `POST /auth/register` | 凭邀请码注册，201 / 400 / 409；`invite_model` 为 `None` 时不挂这条 |
+
+### 整站门禁 + 后台管理员，两道门
+
+典型需求是「整站要登录才能看，后台还要管理员」。这是两个依赖，不是一个，
+`make_user_deps` 一次给出来，直接写在 handler 签名里：
+
+```python
+@router.get("/works")
+async def list_works(session: SessionDep, _: guard.current_user): ...  # 登录即可
+
+
+@router.get("/stats")
+async def stats(session: SessionDep, _: guard.admin_user): ...  # 还要 ADMIN
+```
+
+匿名拿 401，登录了但不是管理员拿 **403**（不是 404 —— 路由表在前端代码里本来就是
+公开的，装作「没有这个接口」除了让人困惑没有别的收益）。
 
 门禁要落在后端。纯前端路由守卫挡不住直接 `curl` 接口 —— 静态文件服务器和反向
 代理层通常没有鉴权，前端拦一道等于没拦。
+
+### 会话里只存 user_id
+
+默认的 `CookieSessionStore` 走 Starlette 的签名 cookie（宿主自己装
+`SessionMiddleware`，secret_key / 有效期 / `https_only` 都是部署决定）。它**只存
+user_id，不存角色** —— 角色每个请求重新查库，这样停用或降级一个账号之后他手上
+那张还没过期的 cookie 立刻失效，而不是等到下次登录。
+
+走 JWT 或 Redis 的宿主实现 `SessionStore` 协议即可，三个方法：
+
+```python
+class SessionStore(Protocol):
+    def login(self, request: Request, user_id: str) -> None: ...
+    def current(self, request: Request) -> str | None: ...
+    def logout(self, request: Request) -> None: ...
+```
+
+### funauth 不起服务
+
+包里**没有** `FastAPI()` 实例、没有 uvicorn 入口，只导出一个装好的 `APIRouter`
+跑在宿主进程里。有三件事必须共享进程才成立：
+
+1. **事务**。凭码注册要让「扣名额」和「建账号」同生共死，现在它就是一个
+   `session.commit()`。跨进程就得靠补偿逻辑或分布式事务。
+2. **cookie 同域**。签名 cookie 必须同域才会带上。
+3. **外键**。`user` 表长在宿主的 `Base` 上，宿主自己的表能正常 FK 引用 `user.id`。
+
+代价是宿主必须是 **Python + FastAPI + SQLAlchemy async**。要给 Go / Node 服务共用
+同一批账号才需要真起一个服务 —— 届时加个 `server.py` 把同一个 router 挂到一个新
+`FastAPI()` 上，现有宿主一行不用改。另外同一个库上有多个宿主时，schema 变更仍然
+走宿主自己的 alembic，**共库的宿主要一起升级**。
 
 ## 邀请码为什么是一条 UPDATE
 

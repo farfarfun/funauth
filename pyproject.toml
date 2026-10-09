@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "funauth"
-version = "0.1.2"
+version = "0.2.0"
 description = "可复用的登录与注册底座：密码登录、角色、邀请码注册（SQLAlchemy 异步）"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,6 +24,15 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.30",
     "bcrypt>=4.0",
 ]
+
+[project.optional-dependencies]
+# 现成的 FastAPI 路由与依赖（`funauth.contrib.fastapi`）。刻意放 extra 里：
+# 纯 CLI、后台任务、或者用别的 web 框架的宿主不该被白拖一个 fastapi 进来。
+#
+# 下限往低写。这个约束会传导到每个宿主身上 —— funauth 写 `>=0.115` 就等于
+# 替所有用它的项目决定了 fastapi 的下限，而本模块只用到 APIRouter / Depends /
+# HTTPException / Request 这几样十年没变过的东西。
+fastapi = ["fastapi>=0.100", "pydantic>=2.0"]
 
 [[project.authors]]
 name = "牛哥"
@@ -50,6 +59,10 @@ dev = [
     "pytest-asyncio>=0.23",
     "aiosqlite>=0.20",
     "ruff>=0.11.0",
+    # contrib/fastapi 的测试要真起一个 app 打请求
+    "fastapi>=0.100",
+    "httpx>=0.27",
+    "itsdangerous>=2.0",  # Starlette SessionMiddleware 需要
 ]
 
 [tool.hatch.build.targets.wheel]
