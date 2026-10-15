@@ -7,11 +7,14 @@
 「对外变化」指的是**宿主项目能感知到的**东西：公开 API、表结构、HTTP 行为、
 安全性质。纯内部重构和注释改动不记在这里 —— 那些看 git log。
 
-## [未发布]
+## [0.2.3] - 2026-10-16
 
 账号管理那一块补齐：角色终于能改了（[#3]），顺带把「人员管理」页要的列表分页、
 改名、自助改密和一组现成的 FastAPI 路由一起做了。`set_active` 有一处**行为变更**，
 见下面的「升级指引」。
+
+> 又一次：版本号是发版工具自动递的修订号，但本次含一处破坏性变更，按语义化版本
+> 本该是 `0.3.0`。升级时别只看版本号就当成安全的修订更新。
 
 ### 新增
 
@@ -230,7 +233,8 @@ ALTER TABLE "user" ALTER COLUMN password_hash DROP NOT NULL;
   核心层不依赖任何 web 框架。
 
 [#3]: https://github.com/farfarfun/funauth/issues/3
-[未发布]: https://github.com/farfarfun/funauth/compare/v0.2.2...HEAD
+[未发布]: https://github.com/farfarfun/funauth/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/farfarfun/funauth/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/farfarfun/funauth/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/farfarfun/funauth/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/farfarfun/funauth/compare/v0.1.2...v0.2.0
