@@ -9,8 +9,71 @@
 
 ## [未发布]
 
+账号管理那一块补齐：角色终于能改了（[#3]），顺带把「人员管理」页要的列表分页、
+改名、自助改密和一组现成的 FastAPI 路由一起做了。`set_active` 有一处**行为变更**，
+见下面的「升级指引」。
+
+### 新增
+
+- **改角色**，`Accounts.set_role()` / `set_role_many()` —— 角色以前只能在
+  `create_user` 那一刻定死，之后只能去动 ORM 属性，服务层就被绕过去了（[#3]）。
+  签名对齐 `set_active`：查无此人返回 `False`，`commit` 可选。
+- **`LastAdmin` 异常** + 「最后一个在用的管理员不许降级 / 停用」护栏，
+  `set_role` / `set_role_many` / `set_active` 三处行为一致。判定只算在用的管理员
+  （停用的登不进来），不会让这个数变少的操作（提升、启用、ADMIN -> ADMIN）
+  一律不拦 —— 那几条恰恰是锁死之后唯一的救场路径。明知故犯传
+  `allow_last_admin=True`，它**刻意没有**对应的 HTTP 查询参数。
+  批量那条是整批一起判的：逐行判会让仅剩的两个管理员互相「证明还有人在」，
+  于是一声不吭地一起降掉。
+- **`Accounts.set_username()`** —— 改用户名，撞车抛 `UsernameTaken`。主要给外部
+  身份注册出来的 `wechat_3f9c1d2a` 这类机器名用。改名不会把人踢下线（会话里存
+  的是 id）。
+- **`Accounts.change_password()`** —— 自助改密，校验旧密码。校验走 `authenticate`，
+  因此继承了它那套共用消息和时序补偿。没设过密码的账号抛新的 `PasswordNotSet`
+  而不是含糊的「用户名或密码不正确」：调用方已经证明了自己就是这个账号，含糊
+  其辞只会让他反复试一个不存在的旧密码。
+- **`Accounts.list_users()` 支持过滤和分页**（`role` / `is_active` / `keyword` /
+  `offset` / `limit`），新增同签名的 **`Accounts.count_users()`** 出总数。
+  `keyword` 走 `ILIKE`（否则 SQLite 和 PostgreSQL 搜出的结果不一样），
+  `%` / `_` / `\` 当字面量处理。不传参数时行为和以前完全一致。
+- **`make_admin_router`**（`funauth.contrib.fastapi`）—— 人员管理页的三条路由：
+  `GET /admin/users`（分页）、`PATCH /admin/users/{user_id}/role`、
+  `PATCH /admin/users/{user_id}/active`。整组要 `ADMIN`，默认不许改自己
+  （`allow_self_change=True` 放开），`LastAdmin` 翻译成 409。
+  配套出参 `AdminUserOut`（比 `UserOut` 多 `is_active`）和泛型分页模型 `UserPage`。
+
+### 变更（破坏性）
+
+- **`set_active` 现在会抛 `LastAdmin`**：停用最后一个在用的管理员时不再静默成功。
+  宿主如果有「停用账号」的运维脚本或后台接口，而那次停用的正好是仅剩的管理员，
+  以前返回 `True`，现在抛异常 —— 没 catch 的话在 FastAPI 宿主里是个 500。
+  见「升级指引」。
+
+### 升级指引
+
+**不需要数据库迁移。** 只有一件事要确认：你有没有在什么地方停用 / 降级管理员。
+
+```python
+# 明知故犯（迁移脚本、拆站、你自己另有后门入口）
+await accounts.set_active(session, username, False, allow_last_admin=True)
+
+# 或者在宿主的 HTTP 层翻译成 409
+except LastAdmin as err:
+    raise HTTPException(409, detail=str(err)) from err
+```
+
+护栏挡不住并发（两个请求同时各降一个管理员，两边都看到对方还在），真撞上了去
+命令行 `create_user(..., UserRole.ADMIN)`。
+
+---
+
+## [0.2.2] - 2026-10-09
+
 本次是一次较大的功能扩张（新增两种登录方式）加三个安全修复。`User` 表有一处
 **破坏性变更**，见下面的「升级指引」。
+
+> 版本号是发版工具自动递的修订号，但内容包含破坏性变更，按语义化版本本该是
+> `0.3.0`。升级时请不要只看版本号就当成安全的修订更新 —— 过一遍「升级指引」。
 
 ### 新增
 
@@ -166,7 +229,9 @@ ALTER TABLE "user" ALTER COLUMN password_hash DROP NOT NULL;
 - 异常体系 `AuthError` 及其子类，全部是 `RuntimeError` 子类而非 HTTP 异常 ——
   核心层不依赖任何 web 框架。
 
-[未发布]: https://github.com/farfarfun/funauth/compare/v0.2.1...HEAD
+[#3]: https://github.com/farfarfun/funauth/issues/3
+[未发布]: https://github.com/farfarfun/funauth/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/farfarfun/funauth/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/farfarfun/funauth/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/farfarfun/funauth/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/farfarfun/funauth/compare/v0.1.1...v0.1.2

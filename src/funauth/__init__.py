@@ -14,6 +14,12 @@
 一个账号可以同时挂多种方式（设了密码、绑了微信、验证过邮箱），`User` 表不会
 因为多接一家而加列。
 
+账号建好之后还能管：改角色（`set_role` / `set_role_many`）、改名
+（`set_username`）、自助改密（`change_password`）、启停（`set_active`）、
+带过滤和分页的列表（`list_users` / `count_users`）。降级和停用默认**拦住**
+「最后一个在用的管理员」，免得宿主把自己锁在后台外面（见
+`funauth.errors.LastAdmin`）。
+
 表结构以 **mixin** 形式提供，具体表由宿主声明在自己的 `Base` 上（理由见
 `funauth.models.mixins` 的模块 docstring）。
 
@@ -75,7 +81,9 @@ from funauth.errors import (
     BadCredentials,
     IdentityTaken,
     InviteUnusable,
+    LastAdmin,
     LastLoginMethod,
+    PasswordNotSet,
     PermissionDenied,
     SignupDisabled,
     UsernameTaken,
@@ -117,7 +125,9 @@ __all__ = [
     "IdentityTaken",
     "InviteCodeMixin",
     "InviteUnusable",
+    "LastAdmin",
     "LastLoginMethod",
+    "PasswordNotSet",
     "PermissionDenied",
     "SignupDisabled",
     "TimestampMixin",

@@ -144,7 +144,9 @@ class TestLogin:
             )
             no_such = await c.post("/auth/login", json={"username": "ghost", "password": "pw1234"})
 
-            await harness.accounts.set_active(session, "boss", False)
+            # boss 是这里唯一的管理员，停用他要显式关掉那条护栏（见 `LastAdmin`）。
+            # 这个测试要的只是「停用的账号登不进来」，不是在验护栏。
+            await harness.accounts.set_active(session, "boss", False, allow_last_admin=True)
             disabled = await c.post(
                 "/auth/login", json={"username": "boss", "password": "pw123456"}
             )
@@ -199,7 +201,8 @@ class TestGates:
             await c.post("/auth/login", json={"username": "boss", "password": "pw123456"})
             assert (await c.get("/protected")).status_code == 200
 
-            await harness.accounts.set_active(session, "boss", False)
+            # 唯一的管理员，同上：这里验的是停用立刻生效，不是最后一个管理员护栏
+            await harness.accounts.set_active(session, "boss", False, allow_last_admin=True)
 
             r = await c.get("/protected")
             assert r.status_code == 401
@@ -519,22 +522,23 @@ class TestSessionStore:
         assert seen == [raw_id], "parse_user_id 没被调用，或者拿到的不是会话里那个值"
 
 
-@pytest.mark.parametrize(
-    ("method", "path"),
-    [
-        ("GET", "/auth/config"),
-        ("GET", "/auth/me"),
-        ("POST", "/auth/login"),
-        ("POST", "/auth/logout"),
-        ("POST", "/auth/register"),
-    ],
-)
-async def test_auth_routes_are_public(harness, method, path):
+async def test_auth_routes_are_public(harness):
     """auth 这组路由不能挂门禁 —— 否则没登录的人连登录接口都打不开。
+
+    遍历 `router.routes` 而不是写死一张路径表：写死的话，哪天有人往这个工厂里
+    加一条要登录的路由，这条测试会安安静静地放过去，而那个工厂的不变量正是
+    「这里每一条都公开」。
 
     只验「没被门禁提前拦掉」：空 body 换来 422、密码不对换来 401 都是另一回事，
     这里看的是匿名请求能不能走到 handler 里。
     """
+    checked = 0
     async with harness.client() as c:
-        r = await c.request(method, path, json={})
-        assert r.status_code in (200, 201, 204, 400, 422), r.status_code
+        for route in harness.auth_router.routes:
+            for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+                r = await c.request(method, route.path, json={})
+                assert r.status_code in (200, 201, 204, 400, 422), (
+                    f"{method} {route.path} -> {r.status_code}，这条路由被门禁挡住了"
+                )
+                checked += 1
+    assert checked == 5, f"auth 路由的条数变了（{checked}），确认新增的那条也是公开的"

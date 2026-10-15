@@ -52,6 +52,12 @@ app.include_router(
     ),
     prefix="/api/v1",
 )
+
+# 「人员管理」页：列表 + 改角色 + 启停，整组要 ADMIN
+app.include_router(
+    make_admin_router(accounts=accounts, session_dep=SessionDep, guards=guard),
+    prefix="/api/v1",
+)
 ```
 
 宿主还要装上 Starlette 的 `SessionMiddleware`（用默认的 `CookieSessionStore`
@@ -63,7 +69,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Annotated, Any, Protocol, runtime_checkable
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from funauth.enums import AuthProvider, UserRole
@@ -71,6 +77,7 @@ from funauth.errors import (
     AccountDisabled,
     BadCredentials,
     InviteUnusable,
+    LastAdmin,
     PermissionDenied,
     SignupDisabled,
     UsernameTaken,
@@ -80,6 +87,7 @@ from funauth.errors import (
 from funauth.services import Accounts, normalize_target
 
 __all__ = [
+    "AdminUserOut",
     "AuthConfigOut",
     "CodeLoginPayload",
     "CodeRequestPayload",
@@ -87,8 +95,12 @@ __all__ = [
     "LoginPayload",
     "RegisterPayload",
     "SessionStore",
+    "SetActivePayload",
+    "SetRolePayload",
     "UserGuards",
     "UserOut",
+    "UserPage",
+    "make_admin_router",
     "make_auth_router",
     "make_code_login_router",
     "make_user_deps",
@@ -171,6 +183,42 @@ class UserOut(BaseModel):
     role: UserRole
 
     model_config = {"from_attributes": True}
+
+
+class AdminUserOut(UserOut):
+    """管理页的默认出参：在 `UserOut` 上多一个 `is_active`。
+
+    不把它并进 `UserOut`：那个是**登录和 `/me`** 的出参，而「这个号停用没有」
+    对当事人没有意义（停用了他根本登不进来），对管理页才有 —— 那张表的第一列
+    就是启停开关。
+    """
+
+    is_active: bool
+
+
+class UserPage[OutT: BaseModel](BaseModel):
+    """分页出参：`{"total": 123, "items": [...]}`。
+
+    写成泛型而不是在工厂里 `create_model` 现造：现造的类每次调用都叫同一个
+    名字，一个 app 里挂两个管理路由就会在 OpenAPI 里撞 schema 名，而宿主拿它
+    生成前端 client。泛型参数化出来的名字（`UserPage_AdminUserOut_`）由
+    pydantic 自己保证唯一。
+
+    宿主换掉 `user_out` 时这里跟着变成 `UserPage[他那个模型]`，`items` 的类型
+    不会和实际返回的对不上。
+    """
+
+    #: 命中过滤条件的总数，**不受 limit / offset 影响** —— 分页器要拿它算页数。
+    total: int
+    items: list[OutT]
+
+
+class SetRolePayload(BaseModel):
+    role: UserRole
+
+
+class SetActivePayload(BaseModel):
+    is_active: bool
 
 
 class AuthConfigOut(BaseModel):
@@ -444,6 +492,185 @@ def make_auth_router(
             except UsernameTaken as err:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(err)) from err
             return _login(request, user)
+
+    return router
+
+
+# --- 管理端：人员管理 -----------------------------------------------------------
+
+#: 列表一次最多给多少条。写死而不是让宿主配：账号表迟早会长到一次拉全表就是
+#: 一个慢查询加一个几兆的响应，而那种页面上线时看不出来，半年后才变成事故。
+MAX_PAGE_SIZE = 200
+
+
+def make_admin_router(
+    *,
+    accounts: Accounts,
+    session_dep: Any,
+    guards: UserGuards,
+    user_out: type[BaseModel] = AdminUserOut,
+    allow_self_change: bool = False,
+    user_id_type: Any = uuid.UUID,
+    prefix: str = "/admin",
+    tags: list[str] | None = None,
+) -> APIRouter:
+    """造出「人员管理」页要的三条路由：列表、改角色、启停。
+
+    ```python
+    guard = make_user_deps(accounts=accounts, session_dep=SessionDep, store=store)
+    app.include_router(
+        make_admin_router(accounts=accounts, session_dep=SessionDep, guards=guard),
+        prefix="/api/v1",
+    )
+    ```
+
+    **这三条全部要求 `ADMIN`**，门禁来自 `guards.admin_user`。
+
+    ## 为什么收整个 `UserGuards` 而不是一个 `admin_user`
+
+    收一个裸依赖的话，宿主手滑传成 `guards.current_user`，造出来的就是一组
+    任何登录用户都能改别人角色的接口 —— 没有任何报错，`dependency_overrides`
+    也测不出来，是一次彻底的越权。收 `UserGuards` 这个具名类型就不会传错。
+    自己另有一套管理员依赖的宿主可以手动拼一个
+    `UserGuards(current_user=..., admin_user=...)`。
+
+    `guards` 必须和 `make_auth_router` 用**同一个 `store`**（以及同一个
+    `parse_user_id`），否则登录写进去的会话和这里读出来的不是一个地方。
+
+    ## 不能改自己
+
+    默认拦住「把自己降为访客」和「停用自己」—— 手滑点到自己那一行的后果是当场
+    失去后台，而这个确认 HTTP 层问不出来。只拦**降级 / 停用**这两个方向：
+    把自己设成 ADMIN、启用自己都是无害的空操作，拦了只会让人困惑。
+
+    真要「交接完就自己退下」的宿主传 `allow_self_change=True`，那时还有
+    `LastAdmin` 兜着最后一个管理员。
+
+    ## 逃生口不上网
+
+    服务层的 `allow_last_admin` **刻意不暴露成查询参数**。一个 `?force=true`
+    就能关掉的安全护栏比没有护栏更糟 —— 前端点着点着就把它加上了。要强行降级
+    最后一个管理员，去命令行。
+
+    Args:
+        accounts: 宿主绑好模型类的 `Accounts` 实例。
+        session_dep: 宿主的 DB 会话依赖。
+        guards: `make_user_deps(...)` 的返回值。
+        user_out: 出参模型，默认 `AdminUserOut`（比 `UserOut` 多一个
+            `is_active`）。换掉它分页出参会自动跟着变成 `UserPage[它]`。
+        allow_self_change: 放开「不能改自己」。
+        user_id_type: 路径参数 `{user_id}` 的类型，默认 `uuid.UUID`。主键不是
+            UUID 的宿主传 `int`，和 `make_user_deps` 的 `parse_user_id`、
+            `user_out.id` 三处要一致。
+        prefix: 路由前缀，默认 `/admin`。
+        tags: OpenAPI 标签，默认 `["admin"]`。
+
+    Returns:
+        装好的 `APIRouter`。
+
+    状态码：不是管理员 403、没登录 401（都来自门禁）、查无此人 404、
+    改到自己 409、撞上最后一个管理员 409。
+    """
+    router = APIRouter(prefix=prefix, tags=tags or ["admin"])
+    admin_user = guards.admin_user
+    page_out = UserPage[user_out]
+
+    async def _fetch(session: Any, user_id: Any) -> Any:
+        user = await accounts.get_by_id(session, user_id)
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="账号不存在")
+        return user
+
+    def _refuse_self(actor: Any, target: Any) -> None:
+        if not allow_self_change and actor.id == target.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="不能改自己，让另一个管理员来操作",
+            )
+
+    def _require_changed(changed: bool) -> None:
+        """服务层按用户名寻址，这里按 id —— 中间那一瞬间对方可能被改名了。
+
+        改名之后 `set_role` 找不到人会返回 `False`，这时候回 200 等于告诉管理员
+        「改好了」而实际什么都没发生。极其罕见，但静默失败是最糟的一种。
+        """
+        if not changed:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="账号不存在")
+
+    async def _reload(session: Any, user_id: Any, fallback: Any) -> Any:
+        """改完之后重新取一遍再序列化。
+
+        服务层提交过了，而提交会 expire 掉会话里的对象（`expire_on_commit` 默认
+        就是开的）。直接序列化手上那个实例会触发一次懒加载 —— 在异步会话里那是
+        `MissingGreenlet`，也就是一个 500。重查一次最省心，顺带把并发改动也带上。
+
+        重查不到（这一瞬间被别人删了）就退回手上那份，总之不能 500。
+        """
+        return await accounts.get_by_id(session, user_id) or fallback
+
+    @router.get("/users", response_model=page_out)
+    async def list_users(
+        session: session_dep,
+        _: admin_user,
+        role: UserRole | None = None,
+        is_active: bool | None = None,
+        keyword: Annotated[str | None, Query(max_length=64)] = None,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 50,
+    ) -> Any:
+        """分页列出账号。`total` 是命中过滤条件的总数，不受 `limit` 影响。
+
+        `keyword` 是用户名的模糊匹配，不区分大小写；`%` 和 `_` 当字面量处理
+        （见 `AccountsBase._user_where`）。限长是为了挡住拿超长字符串换一次
+        全表扫描的。
+        """
+        # 两次查询必须用同一套过滤条件，所以只拼一次 —— 各写一遍迟早分叉，
+        # 而分叉的症状是分页器算出 7 页、翻到第 4 页是空的。
+        filters = {"role": role, "is_active": is_active, "keyword": keyword}
+        total = await accounts.count_users(session, **filters)
+        items = await accounts.list_users(session, offset=offset, limit=limit, **filters)
+        return page_out(total=total, items=[user_out.model_validate(u) for u in items])
+
+    @router.patch("/users/{user_id}/role", response_model=user_out)
+    async def set_role(
+        user_id: user_id_type,
+        payload: SetRolePayload,
+        session: session_dep,
+        actor: admin_user,
+    ) -> Any:
+        """把一个账号提成管理员 / 降回访客。"""
+        target = await _fetch(session, user_id)
+        if payload.role != UserRole.ADMIN:
+            _refuse_self(actor, target)
+        try:
+            changed = await accounts.set_role(session, target.username, payload.role)
+        except LastAdmin as err:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(err)) from err
+        _require_changed(changed)
+        return user_out.model_validate(await _reload(session, user_id, target))
+
+    @router.patch("/users/{user_id}/active", response_model=user_out)
+    async def set_active(
+        user_id: user_id_type,
+        payload: SetActivePayload,
+        session: session_dep,
+        actor: admin_user,
+    ) -> Any:
+        """启用 / 停用一个账号。
+
+        停用而不是删除是这个包的既定设计（见 `UserMixin` 的 docstring）：删了行
+        之后会话里存的 user_id 就是悬空引用，而那个 id 以后可能被新账号复用，
+        等于把旧会话悄悄接到新账号上。所以这里**没有**删除端点。
+        """
+        target = await _fetch(session, user_id)
+        if not payload.is_active:
+            _refuse_self(actor, target)
+        try:
+            changed = await accounts.set_active(session, target.username, payload.is_active)
+        except LastAdmin as err:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(err)) from err
+        _require_changed(changed)
+        return user_out.model_validate(await _reload(session, user_id, target))
 
     return router
 

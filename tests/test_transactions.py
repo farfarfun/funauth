@@ -89,6 +89,35 @@ class TestCommitFalse:
         user = await accounts.get_by_username(session, "u")
         assert user.is_active is True
 
+    async def test_set_role(self, session, accounts) -> None:
+        await accounts.create_user(session, "u", "pw", UserRole.GUEST)
+
+        assert await accounts.set_role(session, "u", UserRole.ADMIN, commit=False) is True
+        await session.rollback()
+        assert (await accounts.get_by_username(session, "u")).role is UserRole.GUEST
+
+    async def test_set_role_many(self, session, accounts) -> None:
+        for name in ["a", "b"]:
+            await accounts.create_user(session, name, "pw", UserRole.GUEST)
+
+        assert await accounts.set_role_many(session, ["a", "b"], UserRole.ADMIN, commit=False) == 2
+        await session.rollback()
+        assert await accounts.count_users(session, role=UserRole.ADMIN) == 0
+
+    async def test_set_username(self, session, accounts) -> None:
+        await accounts.create_user(session, "u", "pw", UserRole.GUEST)
+
+        assert await accounts.set_username(session, "u", "renamed", commit=False) is True
+        await session.rollback()
+        assert await accounts.get_by_username(session, "u") is not None
+
+    async def test_change_password(self, session, accounts) -> None:
+        await accounts.create_user(session, "u", "old", UserRole.GUEST)
+
+        await accounts.change_password(session, "u", "old", "new", commit=False)
+        await session.rollback()
+        assert await accounts.authenticate(session, "u", "old")
+
     async def test_revoke_invite(self, session, accounts) -> None:
         code = await accounts.issue_invite(session)
 

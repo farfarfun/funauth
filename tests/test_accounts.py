@@ -1,4 +1,4 @@
-"""密码登录、角色、邀请码、建号。"""
+"""密码登录、角色、邀请码、建号、账号管理。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from sqlalchemy.dialects import postgresql
 from funauth import (
     BadCredentials,
     InviteUnusable,
+    LastAdmin,
+    PasswordNotSet,
     PermissionDenied,
     UsernameTaken,
     UserRole,
@@ -19,6 +21,7 @@ from funauth import (
     hash_password,
 )
 from funauth.models.types import utcnow
+from funauth.services.password import BAD_CREDENTIALS
 
 from .conftest import InviteCode, User
 
@@ -233,3 +236,274 @@ class TestRegister:
         await accounts.create_user(session, "adam", "pw", UserRole.ADMIN)
 
         assert [u.username for u in await accounts.list_users(session)] == ["adam", "zoe"]
+
+
+class TestSetRole:
+    async def test_promote_and_demote(self, session, accounts) -> None:
+        await accounts.create_user(session, "boss", "pw", UserRole.ADMIN)
+        await accounts.create_user(session, "reader", "pw", UserRole.GUEST)
+
+        assert await accounts.set_role(session, "reader", UserRole.ADMIN) is True
+        assert (await accounts.get_by_username(session, "reader")).role is UserRole.ADMIN
+
+        # 现在有两个管理员了，降一个下去是允许的
+        assert await accounts.set_role(session, "boss", UserRole.GUEST) is True
+        assert (await accounts.get_by_username(session, "boss")).role is UserRole.GUEST
+
+    async def test_unknown_user_returns_false(self, session, accounts) -> None:
+        assert await accounts.set_role(session, "nobody", UserRole.ADMIN) is False
+
+
+async def _demote_boss(accounts, session, **kwargs) -> None:
+    await accounts.set_role(session, "boss", UserRole.GUEST, **kwargs)
+
+
+async def _disable_boss(accounts, session, **kwargs) -> None:
+    await accounts.set_active(session, "boss", False, **kwargs)
+
+
+class TestLastAdminGuard:
+    """「最后一个在用的管理员」不许降级，也不许停用。
+
+    降完 / 停完就没人进得去后台了，补救只能去命令行 —— 而点「降为访客」的人
+    正在整理名单，完全不会想到这一层。两个方法行为必须一致：拦住降级却放过
+    停用，等于把同一个坑留了另一个入口。下面每条都对两个方法各跑一遍。
+    """
+
+    @pytest.fixture
+    async def sole_admin(self, session, accounts):
+        return await accounts.create_user(session, "boss", "pw", UserRole.ADMIN)
+
+    @pytest.fixture(params=[_demote_boss, _disable_boss], ids=["set_role", "set_active"])
+    def remove_admin(self, request):
+        return request.param
+
+    async def test_blocked(self, session, accounts, sole_admin, remove_admin) -> None:
+        with pytest.raises(LastAdmin):
+            await remove_admin(accounts, session)
+
+        await session.rollback()
+        boss = await accounts.get_by_username(session, "boss")
+        assert boss.role is UserRole.ADMIN and boss.is_active is True
+
+    async def test_escape_hatch(self, session, accounts, sole_admin, remove_admin) -> None:
+        """明知故犯的出口：迁移脚本、拆站、宿主另有后门入口。"""
+        await remove_admin(accounts, session, allow_last_admin=True)
+        boss = await accounts.get_by_username(session, "boss")
+        assert (boss.role, boss.is_active) != (UserRole.ADMIN, True)
+
+    async def test_allowed_when_another_active_admin_remains(
+        self, session, accounts, sole_admin, remove_admin
+    ) -> None:
+        await accounts.create_user(session, "second", "pw", UserRole.ADMIN)
+        await remove_admin(accounts, session)
+
+    async def test_a_disabled_admin_does_not_count(
+        self, session, accounts, sole_admin, remove_admin
+    ) -> None:
+        """停用的管理员登不进来，不能拿他给自己壮胆。"""
+        await accounts.create_user(session, "retired", "pw", UserRole.ADMIN)
+        await accounts.set_active(session, "retired", False)
+
+        with pytest.raises(LastAdmin):
+            await remove_admin(accounts, session)
+
+    async def test_guest_is_never_guarded(self, session, accounts) -> None:
+        """一个管理员都没有的站里停用访客，不该撞上「最后一个管理员」。"""
+        await accounts.create_user(session, "reader", "pw", UserRole.GUEST)
+
+        assert await accounts.set_active(session, "reader", False) is True
+        assert await accounts.set_role(session, "reader", UserRole.GUEST) is True
+
+    async def test_already_inactive_admin_can_be_demoted(self, session, accounts) -> None:
+        """清理一个本来就停用的管理员，不会让情况更糟，所以不许拦。
+
+        拦了的后果是：一旦在用管理员归零，连打扫卫生都做不了。
+        """
+        await accounts.create_user(session, "retired", "pw", UserRole.ADMIN)
+        await accounts.set_active(session, "retired", False, allow_last_admin=True)
+
+        assert await accounts.set_role(session, "retired", UserRole.GUEST) is True
+
+    async def test_recovery_paths_are_never_guarded(self, session, accounts) -> None:
+        """锁死之后的三条救场路径必须畅通：启用、提升、以及把管理员设成管理员。"""
+        await accounts.create_user(session, "retired", "pw", UserRole.ADMIN)
+        await accounts.create_user(session, "reader", "pw", UserRole.GUEST)
+        await accounts.set_active(session, "retired", False, allow_last_admin=True)
+        assert await accounts.count_users(session, role=UserRole.ADMIN, is_active=True) == 0
+
+        assert await accounts.set_role(session, "reader", UserRole.ADMIN) is True
+        assert await accounts.set_active(session, "retired", True) is True
+        assert await accounts.set_role(session, "retired", UserRole.ADMIN) is True
+
+
+class TestSetRoleMany:
+    async def test_counts_and_dedupes(self, session, accounts) -> None:
+        for name in ["a", "b"]:
+            await accounts.create_user(session, name, "pw", UserRole.GUEST)
+
+        # 重复的名字只算一次，查无此人的不算 —— 管理页上那几行可能刚被别人改过
+        assert await accounts.set_role_many(session, ["a", "a", "b", "ghost"], UserRole.ADMIN) == 2
+        assert await accounts.count_users(session, role=UserRole.ADMIN) == 2
+
+    async def test_empty_list_is_a_no_op(self, session, accounts) -> None:
+        assert await accounts.set_role_many(session, [], UserRole.ADMIN) == 0
+
+    async def test_the_guard_looks_at_the_whole_batch(self, session, accounts) -> None:
+        """一次降掉仅剩的两个管理员要被拦住，而且**一行都不许改**。
+
+        逐行判会让这两个人互相「证明还有人在」，于是一起被降掉，一声不吭。
+        而中途抛异常会留下半批改完的脏会话 —— 本包的规矩是回滚归调用方，
+        把那种东西甩给他是陷阱。所以判定必须在动手之前、对整批一起做。
+        """
+        for name in ["one", "two"]:
+            await accounts.create_user(session, name, "pw", UserRole.ADMIN)
+
+        with pytest.raises(LastAdmin):
+            await accounts.set_role_many(session, ["one", "two"], UserRole.GUEST)
+
+        assert await accounts.count_users(session, role=UserRole.ADMIN, is_active=True) == 2
+
+    async def test_demoting_all_but_one_is_fine(self, session, accounts) -> None:
+        for name in ["one", "two"]:
+            await accounts.create_user(session, name, "pw", UserRole.ADMIN)
+
+        assert await accounts.set_role_many(session, ["one"], UserRole.GUEST) == 1
+        assert await accounts.count_users(session, role=UserRole.ADMIN, is_active=True) == 1
+
+
+class TestSetUsername:
+    async def test_rename(self, session, accounts) -> None:
+        await accounts.create_user(session, "wechat_3f9c1d2a", "pw", UserRole.GUEST)
+
+        assert await accounts.set_username(session, "wechat_3f9c1d2a", "alice") is True
+        assert await accounts.authenticate(session, "alice", "pw")
+        assert await accounts.get_by_username(session, "wechat_3f9c1d2a") is None
+
+    async def test_collision_is_refused_and_changes_nothing(self, session, accounts) -> None:
+        await accounts.create_user(session, "alice", "pw", UserRole.GUEST)
+        await accounts.create_user(session, "bob", "pw", UserRole.GUEST)
+
+        with pytest.raises(UsernameTaken):
+            await accounts.set_username(session, "bob", "alice")
+        assert (await accounts.get_by_username(session, "bob")).username == "bob"
+
+    async def test_renaming_to_the_same_name_is_a_no_op(self, session, accounts) -> None:
+        await accounts.create_user(session, "alice", "pw", UserRole.GUEST)
+        assert await accounts.set_username(session, "alice", "alice") is True
+
+    async def test_unknown_user_returns_false(self, session, accounts) -> None:
+        assert await accounts.set_username(session, "nobody", "whoever") is False
+
+
+class TestChangePassword:
+    async def test_happy_path(self, session, accounts) -> None:
+        await accounts.create_user(session, "u", "old", UserRole.GUEST)
+
+        user = await accounts.change_password(session, "u", "old", "new")
+        assert user.username == "u"
+        assert await accounts.authenticate(session, "u", "new")
+        with pytest.raises(BadCredentials):
+            await accounts.authenticate(session, "u", "old")
+
+    async def test_wrong_old_password_changes_nothing(self, session, accounts) -> None:
+        await accounts.create_user(session, "u", "old", UserRole.GUEST)
+
+        with pytest.raises(BadCredentials):
+            await accounts.change_password(session, "u", "nope", "new")
+        assert await accounts.authenticate(session, "u", "old")
+
+    async def test_unknown_and_disabled_share_the_login_message(self, session, accounts) -> None:
+        await accounts.create_user(session, "off", "old", UserRole.GUEST)
+        await accounts.set_active(session, "off", False)
+
+        messages = set()
+        for username in ["off", "ghost"]:
+            with pytest.raises(BadCredentials) as err:
+                await accounts.change_password(session, username, "old", "new")
+            messages.add(str(err.value))
+        assert messages == {BAD_CREDENTIALS}
+
+    async def test_passwordless_account_gets_a_useful_error(self, session, accounts) -> None:
+        """微信 / 验证码注册的账号没有旧密码可校验，这里**刻意说实话**。
+
+        调用方是从会话里拿到用户名的，他已经证明了自己就是这个账号；回一句
+        「用户名或密码不正确」只会让他对着表单反复试一个从来不存在的旧密码。
+        """
+        user = await accounts.create_user(session, "wechat_3f9c1d2a", None, UserRole.GUEST)
+        assert user.password_hash is None
+
+        with pytest.raises(PasswordNotSet) as err:
+            await accounts.change_password(session, "wechat_3f9c1d2a", "whatever", "new")
+        assert str(err.value) != BAD_CREDENTIALS
+
+
+class TestUserListing:
+    @pytest.fixture
+    async def crowd(self, session, accounts):
+        await accounts.create_user(session, "Alice", "pw", UserRole.ADMIN)
+        await accounts.create_user(session, "bob", "pw", UserRole.GUEST)
+        await accounts.create_user(session, "carol", "pw", UserRole.GUEST)
+        await accounts.create_user(session, "wechat_3f9c1d2a", None, UserRole.GUEST)
+        await accounts.set_active(session, "carol", False)
+
+    async def test_filters(self, session, accounts, crowd) -> None:
+        admins = await accounts.list_users(session, role=UserRole.ADMIN)
+        assert [u.username for u in admins] == ["Alice"]
+
+        disabled = await accounts.list_users(session, is_active=False)
+        assert [u.username for u in disabled] == ["carol"]
+
+        # is_active=False 是一个过滤条件，不是「这项没传」
+        assert await accounts.count_users(session, is_active=False) == 1
+        assert await accounts.count_users(session, is_active=True) == 3
+        assert await accounts.count_users(session) == 4
+
+    async def test_keyword_is_case_insensitive(self, session, accounts, crowd) -> None:
+        """SQLite 的 LIKE 对 ASCII 不区分大小写而 PostgreSQL 区分。
+
+        用 `like` 的话这条在测试里绿、在生产上搜不着 —— 本包承诺两个库行为一致。
+        """
+        assert [u.username for u in await accounts.list_users(session, keyword="ALI")] == ["Alice"]
+
+    async def test_wildcards_in_the_keyword_are_literal(self, session, accounts, crowd) -> None:
+        """`_` 和 `%` 必须当字面量。
+
+        不转义的话自动生成的用户名（`wechat_3f9c1d2a` 这种全带下划线）一搜就乱
+        套，而一个 `%` 就能匹配全表 —— 分页器拿着「总数 4」渲染一个空列表。
+        """
+        assert await accounts.count_users(session, keyword="%") == 0
+        assert await accounts.count_users(session, keyword="b_b") == 0
+        assert await accounts.count_users(session, keyword="wechat_") == 1
+        # 反斜杠要先换，不然后面补出来的转义符会被二次转义，PostgreSQL 直接报错
+        assert await accounts.count_users(session, keyword="a\\b") == 0
+
+    async def test_keyword_compiles_to_an_escaped_ilike(self, accounts) -> None:
+        """盯住发出去的 SQL：行为测试在 SQLite 上对 `like` 也会绿。"""
+        condition = accounts._user_where(role=None, is_active=None, keyword="a_b")[0]
+        sql = str(condition.compile(dialect=postgresql.dialect()))
+        assert "ILIKE" in sql.upper(), "大小写敏感性会在 PostgreSQL 上和测试不一致"
+        assert "ESCAPE" in sql.upper(), "没有 ESCAPE，转义出来的反斜杠自己会变成字面量"
+
+    async def test_pagination(self, session, accounts, crowd) -> None:
+        names = [u.username for u in await accounts.list_users(session)]
+        assert names == ["Alice", "bob", "carol", "wechat_3f9c1d2a"]
+
+        page = await accounts.list_users(session, offset=1, limit=2)
+        assert [u.username for u in page] == ["bob", "carol"]
+
+        # 翻过头给空页，总数照旧 —— 分页器据此退回最后一页
+        assert await accounts.list_users(session, offset=99, limit=2) == []
+        assert await accounts.count_users(session) == 4
+
+    async def test_limit_zero_means_zero_rows(self, session, accounts, crowd) -> None:
+        """`None` 才是「不限」，`0` 是「别给我」。真值判断会把两者搞混。"""
+        assert await accounts.list_users(session, limit=0) == []
+        assert len(await accounts.list_users(session, limit=None)) == 4
+
+    async def test_count_matches_the_list_for_the_same_filters(
+        self, session, accounts, crowd
+    ) -> None:
+        for filters in [{}, {"role": UserRole.GUEST}, {"keyword": "o"}, {"is_active": True}]:
+            listed = await accounts.list_users(session, **filters)
+            assert await accounts.count_users(session, **filters) == len(listed), filters

@@ -14,13 +14,16 @@
   [建单例](#2-建一个单例) · [用](#3-用)
 - 登录方式：[外部身份（微信 / QQ）](#外部身份微信--qq-扫码) ·
   [邮箱 / 短信验证码](#邮箱--短信验证码)
+- [账号管理](#账号管理)：[改角色](#改角色) ·
+  [最后一个管理员](#最后一个管理员不许降级也不许停用) ·
+  [列表与分页](#列表过滤与分页) · [改名与改密](#改名与改密)
 - [异常与建议状态码](#异常)
 - [FastAPI](#fastapi)：[验证码路由](#验证码登录的路由) ·
-  [两道门](#整站门禁--后台管理员两道门) · [会话方案](#会话里只存-user_id) ·
-  [为什么不起独立服务](#funauth-不起服务)
+  [两道门](#整站门禁--后台管理员两道门) · [人员管理路由](#人员管理路由) ·
+  [会话方案](#会话里只存-user_id) · [为什么不起独立服务](#funauth-不起服务)
 - 设计说明：[邀请码为什么是一条 UPDATE](#邀请码为什么是一条-update) ·
   [往后再加登录方式](#往后再加登录方式)
-- [从 0.2.x 升级](#从-02x-升级) · [源码导览](#源码导览) · [开发](#开发)
+- [从 0.2.1 及更早升级](#从-021-及更早升级) · [源码导览](#源码导览) · [开发](#开发)
 
 ## 特性
 
@@ -38,7 +41,8 @@
 
 - 密码登录（bcrypt）：用户名不存在 / 密码不对 / 账号停用 / **没设过密码**共用
   一句报错，而且**耗时一致**（失败路径也跑一次 bcrypt，不然按响应时间就能枚举）
-- 两级角色 `UserRole.ADMIN` / `GUEST`，所有自助入口产出的账号恒为 `GUEST`
+- 两级角色 `UserRole.ADMIN` / `GUEST`，所有自助入口产出的账号恒为 `GUEST`；
+  建号之后随时可改（`set_role`），但**降不掉最后一个在用的管理员**
 - 邀请码：限次、限期、可单独吊销，名额消耗是**一条条件 UPDATE**，并发安全
 - 外部身份：`(provider, external_id) -> user_id` 一张表，**绝不按邮箱自动合并
   账号**（那是个账号接管漏洞，见下文）
@@ -46,8 +50,9 @@
   发送限频（短信是花钱的）
 - 不依赖任何 web 框架，不管 session / cookie / JWT
 - 列类型可移植：PostgreSQL 与 SQLite 上行为一致（时间列始终 UTC-aware）
-- 可选的 FastAPI 适配（`funauth[fastapi]`）：现成端点 + 整站门禁 / 管理员两道门，
-  宿主一行 `include_router` 接上
+- 账号管理：改角色、改名、自助改密、启停，列表带过滤和分页
+- 可选的 FastAPI 适配（`funauth[fastapi]`）：现成端点 + 整站门禁 / 管理员两道门
+  + 人员管理路由，宿主一行 `include_router` 接上
 
 ## 不负责什么
 
@@ -62,7 +67,8 @@
 
 - **公开写方法**默认 `commit=True` 自己提交；传 `commit=False` 则只 flush，提交
   留给你 —— 要把账号操作和你自己的写入（建默认工作区之类）凑进**同一个事务**时
-  用这个。这一档包括 `create_user`、`set_password`、`set_active`、`issue_invite`、
+  用这个。这一档包括 `create_user`、`set_password`、`set_active`、`set_role`、
+  `set_role_many`、`set_username`、`change_password`、`issue_invite`、
   `revoke_invite`、`register_with_invite`、`login_with_identity`、`link_identity`、
   `unlink_identity`、`issue_verification_code`、`login_with_code`。
 - **`consume_invite` 从不提交**，也刻意没有 `commit` 参数（理由见下文「邀请码
@@ -260,6 +266,111 @@ user, created = await accounts.login_with_code(session, AuthProvider.EMAIL, emai
 代价是这个方法在失败路径上会提交一次，所以请在请求的早期调用它，别在同一个会话里
 攒了一堆待写的东西之后才调。
 
+## 账号管理
+
+账号建好之后的那些操作，「人员管理」页要的一套都在这里。签名风格统一：
+查无此人返回 `False`（不抛），`commit` 默认 `True`。
+
+| 方法 | 干什么 |
+|---|---|
+| `set_role(session, username, role)` | 改角色（提成管理员 / 降回访客） |
+| `set_role_many(session, usernames, role)` | 批量改角色，返回实际改到的条数 |
+| `set_active(session, username, active)` | 启用 / 停用 |
+| `set_username(session, username, new_username)` | 改用户名，撞车抛 `UsernameTaken` |
+| `set_password(session, username, password)` | 管理员重置密码，不问旧密码 |
+| `change_password(session, username, old, new)` | 自助改密，校验旧密码 |
+| `list_users(session, *, role, is_active, keyword, offset, limit)` | 列表，带过滤和分页 |
+| `count_users(session, *, role, is_active, keyword)` | 同样的过滤条件出总数 |
+
+**没有删除账号的方法**，这是设计不是遗漏：停用走 `is_active`，删了行之后会话和
+外部系统里存的 user_id 就是悬空引用，而那个 id 以后可能被新账号复用 —— 等于把
+旧会话悄悄接到新账号上。
+
+### 改角色
+
+```python
+from funauth import UserRole
+
+await accounts.set_role(session, "reader", UserRole.ADMIN)   # 提成管理员
+await accounts.set_role(session, "boss", UserRole.GUEST)     # 降回访客
+await accounts.set_role_many(session, ["a", "b"], UserRole.GUEST)  # 勾选多行
+```
+
+### 最后一个管理员：不许降级，也不许停用
+
+把最后一个**在用的**管理员降级或停用，会抛 `LastAdmin`：
+
+```python
+await accounts.set_role(session, "boss", UserRole.GUEST)
+# LastAdmin: 这是最后一个在用的管理员，请先把别人提成管理员再操作
+
+await accounts.set_active(session, "boss", False)   # 同样拦住
+```
+
+降完就没人进得去后台了，而点「降为访客」的人正在整理名单，完全不会想到这一层 ——
+补救只能去命令行。两个方法行为一致：只拦住降级却放过停用，等于把同一个坑留了
+另一个入口。
+
+判定只算**在用的**管理员（`role == ADMIN and is_active`）—— 停用的管理员登不进来，
+拿他给自己壮胆等于没有护栏。反过来，不会让这个数变少的操作一律不拦：提升、启用、
+把管理员再设成管理员、改访客，都照常走（锁死之后那几条恰恰是唯一的救场路径）。
+
+明知故犯有出口：
+
+```python
+await accounts.set_role(session, "boss", UserRole.GUEST, allow_last_admin=True)
+```
+
+迁移脚本、拆站、或者你自己另有后门入口时用。**它刻意没有被做成 HTTP 查询参数** ——
+一个点一下就能关掉的安全护栏比没有护栏更糟。
+
+要在界面上提前把按钮灰掉，自己数一下：
+
+```python
+await accounts.count_users(session, role=UserRole.ADMIN, is_active=True)
+```
+
+这条护栏挡不住**并发**：两个请求同时各降一个管理员，两边都会看到对方还在。
+和用户名查重不同，这里没有库侧的兜底（唯一约束拦得住重名，拦不住「管理员归零」）。
+真撞上了，救场方式是命令行里 `create_user(..., UserRole.ADMIN)`。
+
+### 列表、过滤与分页
+
+```python
+total = await accounts.count_users(session, keyword="wang", is_active=True)
+users = await accounts.list_users(
+    session, keyword="wang", is_active=True, offset=0, limit=50
+)
+```
+
+`keyword` 是用户名的模糊匹配、**不区分大小写**（用 `ILIKE`，否则 SQLite 和
+PostgreSQL 会搜出不同结果），`%` / `_` / `\` 一律当字面量 —— 不转义的话微信注册
+出来的 `wechat_3f9c1d2a` 这种名字一搜就乱套，而一个 `%` 就能匹配全表。
+
+不传参数就是「全部账号、按用户名排序」，和以前一样。管理页**应该传** `limit`：
+账号表迟早会长到一次拉全表就是一个慢查询加一个大响应。
+
+### 改名与改密
+
+```python
+# 微信扫码进来的账号叫 wechat_3f9c1d2a，让他换一个能记住的
+await accounts.set_username(session, "wechat_3f9c1d2a", "alice")
+
+# 自助改密：校验旧密码（共用登录那套含糊消息和时序补偿）
+await accounts.change_password(session, "alice", "old-pw", "new-pw")
+```
+
+改名**不会把人踢下线** —— 会话里存的是 `user.id` 不是用户名。
+
+改密同样**不会**让别处已登录的会话失效：funauth 不持有会话，也没有「密码世代」
+这种列。要做到「改密即全端下线」得你自己来（记一个 `password_changed_at`，
+会话里存上，每个请求比一次）。用户普遍以为改密会踢人，这件事要在界面上说清楚。
+
+没设过密码的账号（微信 / 验证码注册的）调 `change_password` 会抛
+`PasswordNotSet`，而不是含糊的「用户名或密码不正确」—— 调用方是从会话里拿到
+用户名的，他已经证明了自己就是这个账号，含糊其辞只会让他对着表单反复试一个
+从来不存在的旧密码。那种「第一次设密码」的流程校验完会话直接调 `set_password`。
+
 ## 异常
 
 全是 `RuntimeError` 的子类，**不是** HTTP 异常：
@@ -276,15 +387,22 @@ user, created = await accounts.login_with_code(session, AuthProvider.EMAIL, emai
 | `SignupDisabled` | 这个外部身份没绑过账号，且注册未开放 | 403 |
 | `IdentityTaken` | 这个外部身份已绑在别的账号上 | 409 |
 | `LastLoginMethod` | 不能解绑：这是最后一种登录方式 | 409 |
+| `LastAdmin` | 不能降级 / 停用：这是最后一个在用的管理员 | 409 |
+| `PasswordNotSet` | 改密时发现这个账号从来没设过密码 | 400 |
 
 `BadCredentials`（四种）、`InviteUnusable`（四种）、`VerificationFailed`（五种）
 各自**共用一条消息**，刻意不区分：分开报的话登录接口就是个用户名枚举器（拿字典
 刷一遍，回「密码不对」的那些就是真实存在的账号），注册接口就是个「这个码存不存在」
 的探测器。真正需要知道区别的是运维自己，而运维看得到数据库。
 
-而 `AccountDisabled` / `SignupDisabled` / `IdentityTaken` **刻意说实话** ——
-能走到它们的前提是对方已经证明了自己拥有那个外部身份，含糊其辞不多保护任何东西，
-只会让他去反复重试一个永远不会成功的操作。
+而 `AccountDisabled` / `SignupDisabled` / `IdentityTaken` / `PasswordNotSet`
+**刻意说实话** —— 能走到它们的前提是对方已经证明了自己拥有那个外部身份（或者
+已经登录了），含糊其辞不多保护任何东西，只会让他去反复重试一个永远不会成功的
+操作。
+
+`LastLoginMethod` 和 `LastAdmin` 是另一类：它们不是「你错了」，是「这件事会把
+人锁在门外，确认一下」。两条都可以关 —— 前者先设个密码，后者传
+`allow_last_admin=True`。
 
 ## FastAPI
 
@@ -385,6 +503,55 @@ async def stats(session: SessionDep, _: guard.admin_user): ...  # 还要 ADMIN
 门禁要落在后端。纯前端路由守卫挡不住直接 `curl` 接口 —— 静态文件服务器和反向
 代理层通常没有鉴权，前端拦一道等于没拦。
 
+### 人员管理路由
+
+「列出账号、把访客提成管理员、停用一个号」这套后台页，`make_admin_router` 直接
+给现成的：
+
+```python
+from funauth.contrib.fastapi import make_admin_router
+
+app.include_router(
+    make_admin_router(accounts=accounts, session_dep=SessionDep, guards=guard),
+    prefix="/api/v1",
+)
+```
+
+| 端点 | 说明 |
+|---|---|
+| `GET /admin/users` | 分页列表，query：`role` / `is_active` / `keyword` / `offset` / `limit`（默认 50，上限 200）。回 `{"total": N, "items": [...]}` |
+| `PATCH /admin/users/{user_id}/role` | body `{"role": "admin"}`，回更新后的账号 |
+| `PATCH /admin/users/{user_id}/active` | body `{"is_active": false}`，回更新后的账号 |
+
+**整组要 `ADMIN`**：没登录 401、登录了但不是管理员 403、查无此人 404、
+改到自己 409、撞上最后一个管理员 409。
+
+收的是整个 `guards`（`make_user_deps` 的返回值）而不是一个裸依赖：收裸依赖的话
+手滑传成 `guards.current_user`，造出来的就是一组**任何登录用户都能改别人角色**的
+接口，而且不会有任何报错。`guards` 必须和 `make_auth_router` 用同一个 `store`。
+
+默认出参是 `AdminUserOut`（比 `UserOut` 多一个 `is_active`，管理表格第一列就是
+那个开关）。寻址用 `user_id` 而不是用户名 —— 用户名现在可以改。
+
+默认**不许改自己**（降级、停用），手滑点到自己那一行的后果是当场失去后台，而这个
+确认 HTTP 层问不出来；把自己设成管理员、启用自己这类空操作照常放行。要「交接完
+自己退下」就传 `allow_self_change=True`，那时还有 `LastAdmin` 兜着。
+
+没有删除端点，理由见上面[账号管理](#账号管理)那一节。自助改密**不在**这里，也
+不在 `make_auth_router` 里（那个工厂的不变量是「每条路由都公开」）—— 自己拿
+`guard.current_user` 挂一条：
+
+```python
+@router.post("/me/password")
+async def change_my_password(payload: PwPayload, session: SessionDep, me: guard.current_user):
+    try:
+        await accounts.change_password(session, me.username, payload.old, payload.new)
+    except PasswordNotSet as err:
+        raise HTTPException(400, detail=str(err)) from err
+    except BadCredentials as err:
+        raise HTTPException(401, detail=str(err)) from err
+```
+
 ### 会话里只存 user_id
 
 默认的 `CookieSessionStore` 走 Starlette 的签名 cookie（宿主自己装
@@ -458,7 +625,7 @@ challenge-response）。那时候照 `services/identity.py` 的样子写一个�
 上即可，`User` 表同样不用动 —— 多种登录方式共用一个账号，靠身份表关联，而不是给
 `User` 不断加列。
 
-## 从 0.2.x 升级
+## 从 0.2.1 及更早升级
 
 `User.password_hash` 现在是**可空**的（微信 / 验证码注册出来的账号没有密码），
 已有库需要一条迁移：
@@ -483,10 +650,10 @@ ALTER TABLE "user" ALTER COLUMN password_hash DROP NOT NULL;
 | `models/mixins.py` | 四张表的 mixin | 为什么导出 mixin 而不是现成模型类；唯一约束和外键为什么留给宿主；时间列为什么是可选的 |
 | `models/types.py` | `PkType`、`uuid7()`、`UTCDateTime` | 为什么自己实现 uuid7；SQLite 和 PostgreSQL 的时区行为差异怎么抹平 |
 | `enums.py` | `UserRole`、`AuthProvider` | 为什么枚举列不建 CHECK 约束；角色为什么不做数值比较 |
-| `errors.py` | `AuthError` 及子类 | 哪些失败必须共用一条消息，哪些该说实话，各自的理由 |
+| `errors.py` | `AuthError` 及子类 | 哪些失败必须共用一条消息，哪些该说实话，各自的理由；最后一个管理员为什么拦得住人、拦不住并发 |
 | `security.py` | bcrypt 两函数 | 为什么不用 passlib；为什么脏哈希返回 `False` 而不抛 |
-| `services/base.py` | `AccountsBase` | 为什么是实例持有而不是模块级全局；事务边界那四档 |
-| `services/password.py` | 密码登录、建号改密 | 为什么失败路径也要跑一次 bcrypt（时序侧信道） |
+| `services/base.py` | `AccountsBase`、账号查询 | 为什么是实例持有而不是模块级全局；事务边界那四档；列表过滤为什么用 `ILIKE` 且要转义通配符 |
+| `services/password.py` | 密码登录、建号改密、角色与启停 | 为什么失败路径也要跑一次 bcrypt（时序侧信道）；最后一个管理员的护栏为什么只写一处、批量为什么要整批一起判 |
 | `services/invite.py` | 邀请码 | 为什么消耗必须是一条条件 UPDATE 且不提交 |
 | `services/identity.py` | 外部身份 | 为什么握手不在包内；为什么绝不按邮箱自动合并账号；并发怎么靠唯一约束兜住 |
 | `services/verification.py` | 邮箱 / 短信验证码 | 为什么这条链路反而整个在包内；试错计数为什么单独提交；标识为什么要规整 |
@@ -496,13 +663,14 @@ ALTER TABLE "user" ALTER COLUMN password_hash DROP NOT NULL;
 
 | 文件 | 钉住什么 |
 |---|---|
-| `test_accounts.py` | 密码登录、角色、邀请码全生命周期、凭码注册 |
+| `test_accounts.py` | 密码登录、角色、邀请码全生命周期、凭码注册、改角色 / 改名 / 改密、列表过滤分页 |
 | `test_transactions.py` | 事务那四档行为；本包逻辑不依赖宿主的时间列 |
 | `test_timing.py` | 两条失败路径的哈希次数相同（测次数而不是墙上时钟，后者必然 flaky） |
 | `test_identity.py` | 绑定/解绑、不自动合并账号、无密码账号不会把登录接口打成 500 |
 | `test_verification.py` | 限频、限次、一次性、标识规整、试错计数活过 rollback |
 | `test_fastapi.py` | 真起 app 打请求：两道门的状态码、cookie 隔离、自定义 store、脏会话 |
 | `test_fastapi_code_login.py` | 验证码路由端到端：明文不入响应、发送失败回滚、爆破被拦 |
+| `test_fastapi_admin.py` | 人员管理路由：门禁、分页、改自己被拦、最后一个管理员 409；以及提交后序列化不会炸成 500 |
 | `test_packaging.py` | `py.typed` 在位（没它下游拿不到类型标注） |
 
 ## 开发
@@ -516,6 +684,9 @@ uv run --group dev pytest -q
 uv run --group dev ruff format src tests
 uv run --group dev ruff check --fix src tests
 ```
+
+`funbuild build` 发完版后会把 venv 里的 editable 换成刚构建的 wheel，所以**发版之后
+再开发前要重新 `uv sync`**，否则又回到上面那个「测的是拷贝」的状态。
 
 改动对外行为（公开 API、表结构、HTTP 行为、安全性质）时，同时更新
 [CHANGELOG.md](CHANGELOG.md) 的「未发布」一节。纯内部重构不用记 —— 那些看 git log。

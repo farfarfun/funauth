@@ -51,6 +51,24 @@ class TestConstantWork:
         )
         assert len(set(hash_calls)) == 2, "两次该用不同的哈希：一个是真账号的，一个是假的"
 
+    async def test_change_password_inherits_the_padding(
+        self, session, accounts, hash_calls
+    ) -> None:
+        """改密的旧密码校验走 `authenticate`，于是白捡那套补偿。
+
+        自己再写一遍 `verify_password` 的话，「这个用户不存在」那条路径就又会
+        比「旧密码不对」快一个数量级 —— 同一个洞换个入口而已。
+        """
+        session.add(User(username="u", password_hash=hash_password("pw")))
+        await session.commit()
+
+        for username in ["u", "nobody"]:
+            with pytest.raises(BadCredentials):
+                await accounts.change_password(session, username, "wrong", "new")
+
+        assert len(hash_calls) == 2
+        assert len(set(hash_calls)) == 2, "两次该用不同的哈希：一个是真账号的，一个是假的"
+
     async def test_disabled_user_also_burns_a_round(self, session, accounts, hash_calls) -> None:
         """停用账号走的也是「不存在」那条分支，同样要补上计算。"""
         session.add(User(username="off", password_hash=hash_password("pw"), is_active=False))
