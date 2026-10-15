@@ -291,8 +291,8 @@ user, created = await accounts.login_with_code(session, AuthProvider.EMAIL, emai
 ```python
 from funauth import UserRole
 
-await accounts.set_role(session, "reader", UserRole.ADMIN)   # 提成管理员
-await accounts.set_role(session, "boss", UserRole.GUEST)     # 降回访客
+await accounts.set_role(session, "reader", UserRole.ADMIN)  # 提成管理员
+await accounts.set_role(session, "boss", UserRole.GUEST)  # 降回访客
 await accounts.set_role_many(session, ["a", "b"], UserRole.GUEST)  # 勾选多行
 ```
 
@@ -304,7 +304,7 @@ await accounts.set_role_many(session, ["a", "b"], UserRole.GUEST)  # 勾选多�
 await accounts.set_role(session, "boss", UserRole.GUEST)
 # LastAdmin: 这是最后一个在用的管理员，请先把别人提成管理员再操作
 
-await accounts.set_active(session, "boss", False)   # 同样拦住
+await accounts.set_active(session, "boss", False)  # 同样拦住
 ```
 
 降完就没人进得去后台了，而点「降为访客」的人正在整理名单，完全不会想到这一层 ——
@@ -338,9 +338,7 @@ await accounts.count_users(session, role=UserRole.ADMIN, is_active=True)
 
 ```python
 total = await accounts.count_users(session, keyword="wang", is_active=True)
-users = await accounts.list_users(
-    session, keyword="wang", is_active=True, offset=0, limit=50
-)
+users = await accounts.list_users(session, keyword="wang", is_active=True, offset=0, limit=50)
 ```
 
 `keyword` 是用户名的模糊匹配、**不区分大小写**（用 `ILIKE`，否则 SQLite 和
