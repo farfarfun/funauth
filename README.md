@@ -520,10 +520,6 @@ uv run --group dev ruff check --fix src tests
 改动对外行为（公开 API、表结构、HTTP 行为、安全性质）时，同时更新
 [CHANGELOG.md](CHANGELOG.md) 的「未发布」一节。纯内部重构不用记 —— 那些看 git log。
 
-## 许可证
-
-MIT，见 [LICENSE](LICENSE)。
-
 ---
 
 ## 关于 farfarfun
